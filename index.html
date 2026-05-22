@@ -1,0 +1,297 @@
+import os
+import sys
+import sqlite3
+import requests
+import telebot
+import re
+import time
+import threading
+from datetime import datetime, timedelta
+import zoneinfo  
+from PIL import Image, ImageDraw, ImageFont
+
+def get_secret_keys():
+    return SECRET_BOT_TOKEN, SECRET_PA_USERNAME, SECRET_PA_TOKEN
+
+PRAYER_NAMES = ["بەیانی", "ڕۆژهەڵات", "نیوەڕۆ", "عەسـر", "مەغریب", "عیشـا"]
+DB_PATH = "channels.db"
+PRAYER_DB_PATH = "prayer_times.db" # ناوی داتابەیسی کاتەکانی نوێژ و زیکر
+FILENAME = 'server_LIVE.m3u'
+TARGET_GROUP_ID = -1003363762986
+BAD_WORDS = ['xxx', 'sex', 'adult', 'porn', '18+', '+18', 'سکس', 'نەشیاو']
+
+SECRET_BOT_TOKEN = "8521792316:AAEB9VnKemV2s4m4G3BiLSFkuGSnuVFlItw"
+SECRET_PA_USERNAME = "serverblbas"
+SECRET_PA_TOKEN = "1fd1b932a09c93ca0ec0ad24125d3d62a6cfe8be"
+
+bot = telebot.TeleBot(SECRET_BOT_TOKEN)
+
+def setup_database():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            url TEXT,
+            category TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def sync_with_server():
+    bot_token, username, token = get_secret_keys()
+    api_url = f'https://www.pythonanywhere.com/api/v0/user/{username}/files/path/home/{username}/{FILENAME}'
+    headers = {'Authorization': f'Token {token}'}
+    try:
+        response = requests.get(api_url, headers=headers, timeout=20)
+        if response.status_code != 200: return "❌ کێشە لە وەرگرتنی فایل لە هۆستەکەت."
+        lines = response.text.splitlines()
+        channels_list = []
+        current_name, current_group = "کەناڵی نەناسراو", "BLBAS TV"
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('#EXTINF:'):
+                group_match = re.search(r'group-title="([^"]+)"', line)
+                if group_match: current_group = group_match.group(1)
+                if ',' in line: current_name = line.split(',')[-1].strip()
+            elif line and (line.startswith('http://') or line.startswith('https://')):
+                combined_text = f"{current_name.lower()} {current_group.lower()}"
+                if any(bad_word in combined_text for bad_word in BAD_WORDS): continue
+                channels_list.append((current_name, line, current_group))
+                
+        if channels_list:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM channels")
+            cursor.executemany("INSERT INTO channels (name, url, category) VALUES (?, ?, ?)", channels_list)
+            conn.commit()
+            conn.close()
+            return f"✅ سەرکەوتوو بوو!\n📊 سەرجەم {len(channels_list)} کەناڵەکە بە سەرکەوتوویی هاوردە کران."
+        return "📭 هیچ کەناڵێک لە ناو فایلەکەدا نەدۆزرایەوە."
+    except Exception as e: return f"❌ خەتا لە جێبەجێکردندا: {str(e)}"
+
+def get_countdown_data_from_db():
+    tz = zoneinfo.ZoneInfo("Asia/Baghdad")
+    now = datetime.now(tz)
+    current_month = now.month
+    current_day = now.day
+    
+    try:
+        conn = sqlite3.connect(PRAYER_DB_PATH) 
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT fajr, shuruq, dhuhr, asr, maghrib, isha 
+            FROM prayer_times 
+            WHERE month = ? AND day = ?
+        """, (current_month, current_day))
+        row = cursor.fetchone()
+        conn.close()
+        if row: today_times = list(row)
+        else: today_times = ["03:24", "05:04", "12:10", "15:58", "19:14", "20:29"]
+    except Exception as e:
+        print(f"Database error: {e}")
+        today_times = ["03:24", "05:04", "12:10", "15:58", "19:14", "20:29"]
+
+    next_prayer_name, target_dt = None, None
+    for index, t_str in enumerate(today_times):
+        h, min_val = map(int, t_str.split(':'))
+        t_dt = now.replace(hour=h, minute=min_val, second=0, microsecond=0)
+        if t_dt > now:
+            next_prayer_name = PRAYER_NAMES[index]
+            target_dt = t_dt
+            break
+            
+    if not target_dt:
+        tomorrow = now + timedelta(days=1)
+        try:
+            conn = sqlite3.connect(PRAYER_DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT fajr FROM prayer_times WHERE month = ? AND day = ?", (tomorrow.month, tomorrow.day))
+            row_tomorrow = cursor.fetchone()
+            conn.close()
+            t_str = row_tomorrow[0] if row_tomorrow else today_times[0]
+        except: t_str = today_times[0]
+            
+        h, min_val = map(int, t_str.split(':'))
+        target_dt = tomorrow.replace(hour=h, minute=min_val, second=0, microsecond=0)
+        next_prayer_name = PRAYER_NAMES[0]
+        
+    diff = target_dt - now
+    total_seconds = int(diff.total_seconds())
+    hrs = total_seconds // 3600
+    mins = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    total_mins = (total_seconds + 59) // 60
+    
+    return next_prayer_name, hrs, mins, secs, total_mins, today_times
+
+def generate_prayer_image(next_name, hrs, mins, secs, total_mins, today_times):
+    img_path = "prayer_status.png"
+    img = Image.new("RGB", (620, 520), "#121214")
+    draw = ImageDraw.Draw(img)
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+        font_time = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+        font_normal = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+    except: font_title = font_time = font_normal = ImageFont.load_default()
+    draw.rounded_rectangle([25, 25, 595, 170], radius=12, fill="#1c1c24", outline="#292933", width=2)
+    draw.text((50, 45), f"بانگی {next_name}", fill="#ffffff", font=font_title)
+    draw.text((50, 85), f"{str(hrs).zfill(2)} : {str(mins).zfill(2)} : {str(secs).zfill(2)}", fill="#ff4757", font=font_time)
+    draw.text((50, 135), f"{total_mins} خولەک ماوە بۆ بانگی {next_name}", fill="#2ed573", font=font_normal)
+    draw.text((50, 205), "کاتەکانی نوێژ بۆ شاری هەولێر", fill="#ffffff", font=font_title)
+    draw.line([(50, 235), (570, 235)], fill="#292933", width=2)
+    y_pos = 255
+    for idx, name in enumerate(PRAYER_NAMES):
+        draw.text((50, y_pos), f"{name} :", fill="#a4a4a8", font=font_normal)
+        draw.text((250, y_pos), f"{today_times[idx]}", fill="#ffffff", font=font_title)
+        y_pos += 38
+    img.save(img_path)
+    return img_path
+
+def background_scheduler():
+    tz = zoneinfo.ZoneInfo("Asia/Baghdad")
+    sent_payam_today = False
+    while True:
+        try:
+            current_time = datetime.now(tz).strftime("%H:%M")
+            if current_time == "11:00" and not sent_payam_today:
+                message_text = (
+                    "👥 **سڵاو ئەندامانی ئازیزی گرووپی Hawler_iptveditor**\n\n"
+                    "🔴 **پەخشی ڕاستەوخۆی کەناڵی پەیام تیڤی دەستی پێکرد**\n\n"
+                    "📺 **PAYAM TV LIVE**\n"
+                    "🔗 لینک بۆ کارپێکردن:\n"
+                    "`https://media2.streambrothers.com:1936/8218/8218/chunklist_w872504916.m3u8`"
+                )
+                bot.send_message(TARGET_GROUP_ID, message_text, parse_mode='Markdown')
+                sent_payam_today = True
+            if current_time != "11:00": sent_payam_today = False
+            time.sleep(30)
+        except Exception as e: time.sleep(10)
+
+def process_and_send_prayer(message):
+    try:
+        next_name, hrs, mins, secs, total_mins, today_times = get_countdown_data_from_db()
+        photo_path = generate_prayer_image(next_name, hrs, mins, secs, total_mins, today_times)
+        caption_text = (
+            f"🕋 **کاونتداونی نوێژەکانی شاری هەولێر**\n\n"
+            f"⏳ **{total_mins} خولەک** ماوە بۆ بانگی **{next_name}**\n"
+            f"⏱️ کاتی ماوە: `{str(hrs).zfill(2)}:{str(mins).zfill(2)}:{str(secs).zfill(2)}`\n\n"
+            f"✨ نوێژەکانتان قبووڵ بێت."
+        )
+        with open(photo_path, 'rb') as photo:
+            bot.send_photo(message.chat.id, photo, caption=caption_text, parse_mode='Markdown')
+        if os.path.exists(photo_path): os.remove(photo_path)
+    except Exception as e: bot.reply_to(message, f"❌ خەتایەک لە کاتەکانی نوێژ ڕوویدا: {str(e)}")
+
+def get_random_zikr():
+    try:
+        conn = sqlite3.connect(PRAYER_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT zikr_text FROM zikr_times ORDER BY RANDOM() LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        if row: return row[0]
+    except Exception as e: print(f"Zikr error: {e}")
+    return "📿 سُبْحَانَ اللَّهِ وَبِحَمْدِهِ ، سُبْحَانَ اللَّهِ الْعَظِيمِ"
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    welcome_text = (
+        "👤 **بەخێربێیت بۆ بۆتی IPTV BLBAS**\n\n"
+        "🔄 `/sync` - نوێکردنەوەی کەناڵەکان\n"
+        "📊 `/status` - بینینی دۆخی داتابەیس\n"
+        "📜 `/list` - بینینی گرووپەکان\n"
+        "🕋 `/namaj` - کاتەکانی نوێژ\n"
+        "📿 `/zikr` - زیکرێک\n"
+        "🗑️ `/reset` - پاککردنەوەی داتابەیس"
+    )
+    bot.reply_to(message, welcome_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['sync'])
+def sync_data(message):
+    bot.reply_to(message, "⏳ خەریکی داگرتنی کەناڵەکانم...")
+    bot.reply_to(message, sync_with_server())
+
+@bot.message_handler(commands=['status'])
+def show_status(message):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM channels")
+        count = cursor.fetchone()[0]
+        conn.close()
+        bot.reply_to(message, f"📊 **دۆخی داتابەیس:**\n📝 ژمارەی کەناڵەکان: {count} کەناڵ")
+    except Exception as e: bot.reply_to(message, f"❌ خەتا: {str(e)}")
+
+@bot.message_handler(commands=['list'])
+def show_categories(message):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT category FROM channels")
+        categories = cursor.fetchall()
+        conn.close()
+        if categories:
+            reply = "📜 **لیستی گرووپە بەردەستەکان:**\n\n"
+            for index, cat in enumerate(categories, 1): reply += f"{index}. 📁 {cat[0]}\n"
+            bot.reply_to(message, reply)
+        else: bot.reply_to(message, "📭 هیچ گرووپێک نییە.")
+    except Exception as e: bot.reply_to(message, f"❌ خەتا: {str(e)}")
+
+@bot.message_handler(commands=['reset'])
+def reset_database(message):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM channels")
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, "🗑️ **داتابەیسەکە پاککرایەوە!**")
+    except Exception as e: bot.reply_to(message, f"❌ خەتایەک ڕوویدا: {str(e)}")
+
+@bot.message_handler(commands=['namaj'])
+def show_prayers_cmd(message): process_and_send_prayer(message)
+
+@bot.message_handler(commands=['zikr'])
+def show_zikr_cmd(message):
+    zikr_text = get_random_zikr()
+    bot.reply_to(message, f"✨ **زیکری وەرگیراو:**\n\n🕊️ `{zikr_text}`", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    text = message.text.strip().lower()
+    if text in ['bang', 'بانگ', 'نوێژ', 'namaj']:
+        process_and_send_prayer(message)
+        return
+    if text in ['zikr', 'زیکر', 'زیکرەکان']:
+        bot.reply_to(message, f"✨ **زیکری وەرگیراو:**\n\n🕊️ `{get_random_zikr()}`", parse_mode='Markdown')
+        return
+    if len(text) < 2: return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, url, category FROM channels WHERE name LIKE ?", (f'%{text}%',))
+        results = cursor.fetchall()
+        conn.close()
+        if results:
+            reply = f"🔍 **ئەنجامی گەڕان بۆ [{text}]:**\n\n"
+            for name, url, category in results[:15]:
+                reply += f"📺 **ناوی کەناڵ:** {name}\n📁 **گرووپ:** {category}\n🔗 **لینک:** `{url}`\n\n"
+            bot.reply_to(message, reply, parse_mode='Markdown')
+        else: bot.reply_to(message, f"🤷‍♂️ هیچ کەناڵێک بەناوی [{text}] نەدۆزرایەوە.")
+    except Exception as e: print(f"Error searching: {e}")
+
+if __name__ == "__main__":
+    setup_database()
+    threading.Thread(target=background_scheduler, daemon=True).start()
+    print("Bot is running smoothly on the new server...")
+    
+    # 🔁 لۆپی پارێزراو بۆ دووبارە دەستپێکردنەوە لە کاتی پچڕانی ئینتەرنێتدا
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=30)
+        except Exception as e:
+            time.sleep(5)
